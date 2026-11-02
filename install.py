@@ -15,6 +15,7 @@
 
 可重复运行（幂等），MOD 更新后重跑一次即可。
 """
+import ctypes
 import io
 import os
 import re
@@ -25,6 +26,60 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 MARK_MAIN = '"replay.lua",'
 MARK_ENTRY = '-- >>> 剧情回放 MOD 入口'
+
+HOSTS_PATH = os.path.join(os.environ.get('SystemRoot', r'C:\Windows'),
+                          'System32', 'drivers', 'etc', 'hosts')
+HOSTS_DOMAIN = 'rz.protect-file.com'
+HOSTS_IP = '127.0.0.1'
+
+
+def is_admin():
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except Exception:
+        return False
+
+
+def relaunch_as_admin():
+    """以管理员身份重新启动自己（会弹一次 UAC）"""
+    params = ' '.join('"%s"' % a for a in sys.argv)
+    try:
+        rc = ctypes.windll.shell32.ShellExecuteW(None, 'runas', sys.executable, params, None, 1)
+    except Exception as e:
+        print('  提权失败: %s' % e)
+        return False
+    return rc > 32
+
+
+def ensure_hosts():
+    """游戏启动时会去连 rz.protect-file.com 做授权校验，连不上才会走离线分支。
+    这里把它指到 127.0.0.1，省得每台机器手动改。"""
+    if not os.path.exists(HOSTS_PATH):
+        print('  找不到 hosts 文件，跳过')
+        return True
+    try:
+        with open(HOSTS_PATH, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+    except PermissionError:
+        print('  读取 hosts 被拒绝，跳过')
+        return True
+
+    if HOSTS_DOMAIN in content:
+        print('  hosts 已配置 %s，跳过' % HOSTS_DOMAIN)
+        return True
+
+    try:
+        bak = HOSTS_PATH + '.kjhaz_bak'
+        if not os.path.exists(bak):
+            shutil.copy2(HOSTS_PATH, bak)
+        with open(HOSTS_PATH, 'a', encoding='utf-8', newline='\n') as f:
+            f.write('\n%s %s\n' % (HOSTS_IP, HOSTS_DOMAIN))
+        print('  已写入 hosts: %s %s' % (HOSTS_IP, HOSTS_DOMAIN))
+    except PermissionError:
+        print('  写入 hosts 被拒绝（需要管理员权限），可手动添加: %s %s' % (HOSTS_IP, HOSTS_DOMAIN))
+    except Exception as e:
+        print('  写入 hosts 失败: %s' % e)
+    return True
 
 
 def find_mod_dir(game_root):
@@ -107,6 +162,15 @@ def main():
             print('提示：把本脚本放进游戏根目录（有 金庸群侠传X.exe 的那层）再双击运行，')
             print('      或者运行  python install.py "游戏根目录"')
             sys.exit(1)
+
+    # 改 hosts 需要管理员权限，不够就提权重启自己（会弹一次 UAC）
+    if not is_admin():
+        print('需要管理员权限来配置 hosts（游戏必须屏蔽授权校验域名才能进 MOD）。')
+        if relaunch_as_admin():
+            print('已请求提权，请在弹出的窗口里确认…')
+            sys.exit(0)
+        print('提权被取消，继续安装（hosts 那步可能需要你手动处理）。')
+
     mod_dir = find_mod_dir(game_root)
     lua_dir = os.path.join(mod_dir, 'lua')
     print('MOD 目录: %s' % mod_dir)
@@ -117,6 +181,9 @@ def main():
 
     patch_main_lua(os.path.join(lua_dir, 'main.lua'))
     patch_gameengine(os.path.join(lua_dir, 'GameEngine.lua'))
+
+    print('\n[hosts] 屏蔽授权校验域名')
+    ensure_hosts()
 
     print('\n安装完成。进游戏后点左上角主角头像（打开「江湖」面板）即可呼出剧情回放。')
 

@@ -59,8 +59,21 @@ python install.py "你的游戏根目录"
 1. 复制 `lua/replay.lua`、`lua/replay_main.lua` 到 MOD 的 lua 目录
 2. 在 `main.lua` 的 `ROOT_getLuaFiles` 里注册
 3. 在 `GameEngine.lua` 的 `GameEngine_jianghuContent` 里插入呼出入口
+4. **自动配置 hosts**（见下）
 
 可重复运行，不会重复插入。**换 MOD / MOD 更新后重跑一次即可。**
+
+### 关于 hosts
+
+这个 MOD 版游戏启动时会去连 `rz.protect-file.com` 做授权校验，连不上才会走离线分支——所以原版整合包要求你手动改 hosts。脚本会替你处理这条规则：
+
+```
+127.0.0.1 rz.protect-file.com
+```
+
+因为改 hosts 需要管理员权限，**脚本会弹一次 UAC 提权**（点「是」即可）。已经配置过的话会自动跳过，不会重复写入。原 hosts 会备份成 `hosts.kjhaz_bak`。
+
+不想让脚本动 hosts 的话，在 UAC 弹窗点「否」，安装照常完成，但你需要自己加这条规则，否则进不了 MOD。
 
 ## 使用
 
@@ -77,7 +90,7 @@ python install.py "你的游戏根目录"
 | --- | --- |
 | `lua/replay.lua` | 入口层：算 MOD 路径、热重载业务模块 |
 | `lua/replay_main.lua` | 业务层：读剧情库、建 UI、搜索、跳转 |
-| `replay_catalog.txt` | 从游戏内存导出的完整剧情清单（5950 条）。**不随仓库分发**（内含游戏文本），首次运行会自动生成 |
+| `replay_catalog.txt` | 从游戏里导出的完整剧情清单（5950 条），备份用 |
 | `install.py` | 安装脚本 |
 
 运行时会在 MOD 目录生成 `replay_catalog.txt`（剧情缓存，删掉会自动重建）。
@@ -95,5 +108,6 @@ UI 尺寸按 2452×1321 的渲染分辨率标定。换分辨率后如果界面�
 
 ## 已知限制
 
+- **hosts 那条规则没法写进游戏文件里**：域名 `rz.protect-file.com` 在游戏目录的任何文件里都搜不到明文（`Assembly-CSharp.dll`、lua 脚本、资源全查过了），说明是 native 层动态拼接或加密的，没有可替换的字符串。所以只能走系统级 DNS 重定向，做成安装时自动配置。
 - 跳转时会强制关闭地图上的若干面板（人物 / 队伍 / 背包等），这是为了让剧情不被遮挡。跳完剧情会正常回到地图。
 - 剧情是从「当前存档」的状态开始播的，所以有些剧情会因为缺少前置条件而表现异常（比如直接跳过、或对话内容不全）。这是剧情本身的依赖，不是 MOD 的问题。
