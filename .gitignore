@@ -1,0 +1,9 @@
+# 从游戏内存导出的完整剧情清单（含游戏内文本），不随仓库分发
+replay_catalog.txt
+
+# 调试日志
+replay_trace.log
+
+# Python
+__pycache__/
+*.pyc
