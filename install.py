@@ -130,8 +130,17 @@ def patch_gameengine(path):
     if not m:
         sys.exit('GameEngine.lua 里找不到 GameEngine_jianghuContent，请手动插入入口')
     inject = ('\t-- >>> 剧情回放 MOD 入口 >>>\n'
+              '\t-- 只在点「江湖历练」标签时呼出；点头像打开面板时不呼出\n'
               '\tpcall(function()\n'
-              '\t\tif _G.REPLAY_OPEN then _G.REPLAY_OPEN() end\n'
+              '\t\tif not _G.REPLAY_OPEN then return end\n'
+              '\t\tlocal Input = luanet.import_type(\'UnityEngine.Input\')\n'
+              '\t\tlocal Screen = luanet.import_type(\'UnityEngine.Screen\')\n'
+              '\t\tlocal mp = Input.mousePosition\n'
+              '\t\tlocal rx = mp.x / Screen.width\n'
+              '\t\tlocal ry = mp.y / Screen.height\n'
+              '\t\tif rx > 0.14 and rx < 0.42 and ry > 0.72 and ry < 0.94 then\n'
+              '\t\t\t_G.REPLAY_OPEN()\n'
+              '\t\tend\n'
               '\tend)\n'
               '\t-- <<< 剧情回放 MOD 入口 <<<\n')
     src = src[:m.end()] + inject + src[m.end():]
