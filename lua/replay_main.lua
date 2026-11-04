@@ -103,7 +103,16 @@ local function getAllOf(typeName)
     local gm = m:MakeGenericMethod(tarr)
     local objType = Assembly.Load('mscorlib.dll'):GetType('System.Object')
     local oarr = Array.CreateInstance(objType, 0)
-    return LuaTool.CreateLuaTable(gm:Invoke(nil, oarr))
+    local raw = gm:Invoke(nil, oarr)
+    if raw == nil then
+        L('[getAllOf] ' .. typeName .. ' -> 原始返回 null（类型未在 ResourceManager 注册）')
+        return nil
+    end
+    local tbl = LuaTool.CreateLuaTable(raw)
+    local n = 0
+    for _ in pairs(tbl) do n = n + 1 end
+    L('[getAllOf] ' .. typeName .. ' -> count=' .. n)
+    return tbl
 end
 
 local function buildCatalog()
@@ -260,23 +269,47 @@ end
 local COLS, ROWS = 3, 16
 local PAGE_SIZE = COLS * ROWS
 
+-- 前向声明：列表实现在下面，applyFilter 要先能看到这些名字
+local getCGList
+local getMovieList
+
 local function getState()
     if not _G.REPLAY_STATE then
-        _G.REPLAY_STATE = { page = 1, keyword = '', filtered = nil }
+        _G.REPLAY_STATE = { page = 1, keyword = '', filtered = nil, onlyCG = false, onlyMovie = false }
     end
     return _G.REPLAY_STATE
 end
 
 local function applyFilter(st)
-    local cat = getCatalog()
+    -- 先决定基础集合：只看 CG 时用 CG 事件列表，否则用全量剧情
+    local base
+    if st.onlyMovie then
+        local ok, list = pcall(getMovieList)
+        if ok and list then
+            base = list
+        else
+            L('[影片] 取列表失败: ' .. tostring(list))
+            base = {}
+        end
+    elseif st.onlyCG then
+        local ok, list = pcall(getCGList)
+        if ok and list then
+            base = list
+        else
+            L('[CG] 取列表失败: ' .. tostring(list))
+            base = {}
+        end
+    else
+        base = getCatalog()
+    end
     local kw = st.keyword
     if kw == nil or kw == '' then
-        st.filtered = cat
+        st.filtered = base
     else
         local out = {}
         local low = string.lower(kw)
-        for i = 1, #cat do
-            local n = cat[i]
+        for i = 1, #base do
+            local n = base[i]
             if string.find(n, kw, 1, true) or string.find(string.lower(n), low, 1, true) then
                 out[#out + 1] = n
             end
@@ -324,6 +357,170 @@ local function jumpTo(name)
         end)
         T('jump SwitchGameScene ok=' .. tostring(ok2) .. ' err=' .. tostring(e2))
     end
+end
+
+-- ============ CG 事件索引 ============
+-- CG 走两级引用：resource.xml 里 key="场景.xxx" value="CGs/文件名"，
+-- 剧情脚本用 <action type="picture" value="场景.xxx" /> 引用 key。
+-- 这里遍历所有 story 的 actions，把引用了 CG 资源的挑出来。
+local CG_INDEX_FILE = 'replay_cg_index.txt'
+
+local function buildCGIndex()
+    local t0 = os.clock()
+
+    -- 1) 收集媒体资源：CG 图片 和 Movies 影片
+    local cgKeys, movieKeys = {}, {}
+    local okR, resources = pcall(function() return getAllOf('JyGame.Resource') end)
+    if not okR or resources == nil then
+        return nil, '读取 Resource 失败: ' .. tostring(resources)
+    end
+    local nRes = 0
+    for k, r in pairs(resources) do
+        nRes = nRes + 1
+        local v = r.Value
+        if v ~= nil then
+            local head4 = string.sub(v, 1, 4)
+            local head7 = string.sub(v, 1, 7)
+            if head4 == 'CGs/' then cgKeys[r.Key] = v end
+            if head7 == 'Movies/' then movieKeys[r.Key] = v end
+        end
+    end
+    local keyCount, movieKeyCount = 0, 0
+    for _ in pairs(cgKeys) do keyCount = keyCount + 1 end
+    for _ in pairs(movieKeys) do movieKeyCount = movieKeyCount + 1 end
+
+    -- 2) 遍历 story，找 picture 类型的 action 且 value 命中 CG key
+    local okS, stories = pcall(function() return getAllOf('JyGame.Story') end)
+    if not okS or stories == nil then
+        return nil, '读取 Story 失败: ' .. tostring(stories)
+    end
+    local nStory = 0
+    for _ in pairs(stories) do nStory = nStory + 1 end
+    L(string.format('[CG] 资源 %d 条（其中 CG key %d 个），剧情 %d 条', nRes, keyCount, nStory))
+
+    local out, movieOut = {}, {}
+    local seen, seenMovie = {}, {}
+    local scanned = 0
+    local sampleLogged = false
+    local typeCount = {}
+    local bgSamples = 0
+    local movieTypeCount = {}
+    -- 注意：CreateLuaTable 返回的不是数组，必须用 pairs 遍历（用 ipairs 会一个都拿不到）
+    for _, st in pairs(stories) do
+        local nm = st.Name
+        if nm ~= nil and not seen[nm] then
+            local okA, acts = pcall(function() return LuaTool.CreateLuaTable(st.Actions) end)
+            if okA and acts ~= nil then
+                local nAct = 0
+                for _, act in pairs(acts) do
+                    nAct = nAct + 1
+                    local tp = act.type
+                    local vl = act.value
+                    if tp ~= nil then
+                        typeCount[tp] = (typeCount[tp] or 0) + 1
+                    end
+                    -- type 是大写枚举（DIALOG/BATTLE/BACKGROUND/...）
+                    -- 实测没有 PICTURE 类型，CG 是通过 BACKGROUND 切背景实现的
+                    if vl ~= nil then
+                        local isCG = (cgKeys[vl] ~= nil)
+                            or (string.sub(vl, 1, 4) == 'CGs/')
+                            or (cgKeys['场景.' .. tostring(vl)] ~= nil)
+                        local isMovie = (movieKeys[vl] ~= nil)
+                            or (string.sub(vl, 1, 7) == 'Movies/')
+                        -- 影片如果单独有类型，也认
+                        if tp ~= nil and string.find(tp, 'MOVIE') ~= nil then
+                            isMovie = true
+                            movieTypeCount[tp] = (movieTypeCount[tp] or 0) + 1
+                        end
+                        if isCG and not seen[nm] then
+                            out[#out + 1] = nm
+                            seen[nm] = true
+                        end
+                        if isMovie and not seenMovie[nm] then
+                            movieOut[#movieOut + 1] = nm
+                            seenMovie[nm] = true
+                        end
+                    end
+                end
+                if not sampleLogged and scanned < 2 then
+                    L(string.format('[CG] 样例 %s (%d actions)', tostring(nm), nAct))
+                    sampleLogged = true
+                end
+            end
+        end
+        scanned = scanned + 1
+    end
+
+    -- 输出 type 分布，看清有哪些类型
+    local keys = {}
+    for k in pairs(typeCount) do keys[#keys + 1] = k end
+    table.sort(keys, function(a, b) return typeCount[a] > typeCount[b] end)
+    local parts = {}
+    for i = 1, math.min(25, #keys) do
+        parts[#parts + 1] = keys[i] .. ':' .. typeCount[keys[i]]
+    end
+    L('[CG] action 类型分布: ' .. table.concat(parts, ' '))
+
+    local dt = os.clock() - t0
+    table.sort(out)
+    table.sort(movieOut)
+    local mt = {}
+    for k, v in pairs(movieTypeCount) do mt[#mt + 1] = k .. ':' .. v end
+    L(string.format('[CG] 扫描 %d 个 story / CG key %d / 影片 key %d，命中 CG %d 个、影片 %d 个，耗时 %.1fs%s',
+        scanned, keyCount, movieKeyCount, #out, #movieOut, dt,
+        (#mt > 0 and ('，影片类型 ' .. table.concat(mt, ' ')) or '')))
+    _G.REPLAY_MOVIELIST = movieOut
+    return out, nil, keyCount, scanned
+end
+
+-- 优先读缓存文件，没有再扫（扫一次可能要几十秒）
+local MOVIE_INDEX_FILE = 'replay_movie_index.txt'
+
+local function readIndexFile(name)
+    local p = moddir() .. '/' .. name
+    local ok, txt = pcall(function() return File.ReadAllText(p) end)
+    if not ok or not txt or #txt == 0 then return nil end
+    local list = {}
+    for line in txt:gmatch('[^\r\n]+') do
+        if #line > 0 then list[#list + 1] = line end
+    end
+    if #list == 0 then return nil end
+    return list
+end
+
+local function writeIndexFile(name, list)
+    pcall(function()
+        File.WriteAllText(moddir() .. '/' .. name, table.concat(list, '\n'))
+    end)
+end
+
+function getCGList(forceRebuild)
+    if _G.REPLAY_CGLIST and not forceRebuild then return _G.REPLAY_CGLIST end
+    if not forceRebuild then
+        local cached = readIndexFile(CG_INDEX_FILE)
+        if cached then
+            _G.REPLAY_CGLIST = cached
+            _G.REPLAY_MOVIELIST = readIndexFile(MOVIE_INDEX_FILE) or {}
+            L(string.format('[CG] 从缓存读取 CG %d / 影片 %d', #cached, #_G.REPLAY_MOVIELIST))
+            return cached
+        end
+    end
+    local list, err = buildCGIndex()
+    if list == nil then
+        L('[CG] 构建失败: ' .. tostring(err))
+        return nil
+    end
+    _G.REPLAY_CGLIST = list
+    writeIndexFile(CG_INDEX_FILE, list)
+    writeIndexFile(MOVIE_INDEX_FILE, _G.REPLAY_MOVIELIST or {})
+    return list
+end
+
+-- 影片列表（由 buildCGIndex 填充；缓存路径下也从文件读）
+local function getMovieList()
+    if _G.REPLAY_MOVIELIST then return _G.REPLAY_MOVIELIST end
+    getCGList()
+    return _G.REPLAY_MOVIELIST or {}
 end
 
 -- ============ 主界面 ============
@@ -386,7 +583,7 @@ local function buildUI()
     place(closeGo, hw - 36, hh - 42, 44, 44)
 
     -- ===== 搜索栏（用游戏原生输入框，Unity 运行时 InputField 的 IME 不可用）=====
-    local searchW = PW - 330
+    local searchW = PW - 500
     local searchBg, searchImg = makePanel(root, 'SearchBg', Color(0.16, 0.18, 0.24, 1))
     searchImg.raycastTarget = true
     place(searchBg, -hw + 30 + searchW / 2, hh - 94, searchW, 52)
@@ -431,7 +628,7 @@ local function buildUI()
     end
 
     local searchBtn = makeButton(root, 'SearchBtn', '搜索', openSearch)
-    place(searchBtn, hw - 160, hh - 94, 116, 52)
+    place(searchBtn, hw - 145, hh - 94, 96, 52)
 
     local clearBtn = makeButton(root, 'ClearBtn', '清空', function()
         local st2 = getState()
@@ -439,15 +636,34 @@ local function buildUI()
         applyFilter(st2)
         buildUI()
     end)
-    place(clearBtn, hw - 280, hh - 94, 100, 52)
+    place(clearBtn, hw - 235, hh - 94, 80, 52)
 
     local resetBtn = makeButton(root, 'ResetBtn', '全部', function()
         local st2 = getState()
         st2.keyword = ''
+        st2.onlyCG = false
+        st2.onlyMovie = false
         applyFilter(st2)
         buildUI()
     end)
-    place(resetBtn, hw - 55, hh - 94, 88, 52)
+    place(resetBtn, hw - 55, hh - 94, 80, 52)
+
+    -- 只看 CG：过滤出所有调用了 CG 图片资源的事件
+    local cgLabel = st.onlyCG and 'CG ✓' or '只看CG'
+    local cgBtn = makeButton(root, 'CGBtn', cgLabel, function()
+        local st2 = getState()
+        st2.onlyCG = not st2.onlyCG
+        if st2.onlyCG then st2.onlyMovie = false end
+        st2.keyword = ''
+        applyFilter(st2)
+        buildUI()
+    end)
+    place(cgBtn, hw - 345, hh - 94, 130, 52)
+    if st.onlyCG then
+        local cimg = cgBtn:GetComponent(typeOf('UnityEngine.UI.Image'))
+        if cimg then cimg.color = Color(0.62, 0.46, 0.10, 0.98) end
+    end
+
 
     -- 搜索框本身也能点（双入口，免得按钮点不中）
     pcall(function()
