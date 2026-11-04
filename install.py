@@ -12,10 +12,12 @@
     1. 把 replay.lua / replay_main.lua 复制到 <游戏>/gamedata/modcache/<MOD>/lua/
     2. 在 main.lua 的 ROOT_getLuaFiles 里注册 replay.lua
     3. 在 GameEngine.lua 的 GameEngine_jianghuContent 里插入呼出入口
+    4. 给 Assembly-CSharp.dll 打「去掉授权校验」补丁（不再需要改 hosts）
 
 可重复运行（幂等），MOD 更新后重跑一次即可。
+DLL 补丁按代码签名定位，不依赖具体版本号，也不改动文件长度。
 """
-import ctypes
+import glob
 import io
 import os
 import re
@@ -27,59 +29,103 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 MARK_MAIN = '"replay.lua",'
 MARK_ENTRY = '-- >>> 剧情回放 MOD 入口'
 
-HOSTS_PATH = os.path.join(os.environ.get('SystemRoot', r'C:\Windows'),
-                          'System32', 'drivers', 'etc', 'hosts')
-HOSTS_DOMAIN = 'rz.protect-file.com'
-HOSTS_IP = '127.0.0.1'
+# ---------------------------------------------------------------------------
+# DLL 补丁
+#
+# 游戏启动时会调 NetworkClass.GetHostAddress("rz.protect-file.com")，
+# 返回 "127.0.0.1" 才走离线分支。原来是靠改 hosts 骗过这个判断。
+#
+# 现在直接把两处比较的 IL 改掉：
+#     call <string::op_Inequality 包装>   ->   pop; pop; ldc.i4.0; nop; nop
+# 两者栈效果相同（吃掉 2 个 string、压入 1 个 bool），但结果恒为「相等」，
+# 等价于域名永远解析到 127.0.0.1。只改 5 字节，文件长度不变。
+#
+# 补丁点用「前 21 字节 + 原始 5 字节」做签名，已确认在 DLL 中唯一。
+# ---------------------------------------------------------------------------
+PATCH_SITES = [
+    # (名字, 前21字节上下文, 原始5字节, 说明)
+    ('ResourceManager.LoadResource',
+     '49 28 02 00 00 2b 28 2a 2d 00 06 20 44 22 b2 65 28 04 00 00 2b',
+     '28 09 04 00 06'),
+    ('RuntimeData.Load',
+     '5b 28 03 00 00 2b 28 2a 2d 00 06 20 de 42 1c 1c 28 02 00 00 2b',
+     '28 5b 05 00 06'),
+]
+PATCH_NEW = bytes.fromhex('2626160000')     # pop; pop; ldc.i4.0; nop; nop
 
 
-def is_admin():
-    try:
-        return ctypes.windll.shell32.IsUserAnAdmin() != 0
-    except Exception:
-        return False
+def find_dll(game_root):
+    """找 <游戏>/*_Data/Managed/Assembly-CSharp.dll"""
+    cands = glob.glob(os.path.join(game_root, '*_Data', 'Managed', 'Assembly-CSharp.dll'))
+    if not cands:
+        sys.exit('找不到 *_Data/Managed/Assembly-CSharp.dll，请确认路径是游戏根目录')
+    if len(cands) > 1:
+        # 优先带「金庸」的那个
+        for c in cands:
+            if '金庸' in c:
+                return c
+    return cands[0]
 
 
-def relaunch_as_admin():
-    """以管理员身份重新启动自己（会弹一次 UAC）"""
-    params = ' '.join('"%s"' % a for a in sys.argv)
-    try:
-        rc = ctypes.windll.shell32.ShellExecuteW(None, 'runas', sys.executable, params, None, 1)
-    except Exception as e:
-        print('  提权失败: %s' % e)
-        return False
-    return rc > 32
+def patch_dll(game_root):
+    dll = find_dll(game_root)
+    print('  DLL: %s' % dll)
+    data = bytearray(open(dll, 'rb').read())
+    orig_len = len(data)
+
+    done = 0
+    pending = []
+    for name, prefix_hex, call_hex in PATCH_SITES:
+        prefix = bytes.fromhex(prefix_hex.replace(' ', ''))
+        call = bytes.fromhex(call_hex.replace(' ', ''))
+        pos = data.find(prefix)
+        if pos < 0:
+            print('  [跳过] %s: 找不到代码签名（游戏版本可能不同）' % name)
+            continue
+        at = pos + len(prefix)
+        cur = bytes(data[at:at + 5])
+        if cur == PATCH_NEW:
+            print('  [已有] %s: 已经是补丁状态' % name)
+            done += 1
+            continue
+        if cur != call:
+            print('  [跳过] %s: 签名后紧跟的字节不符（%s）' % (name, cur.hex(' ')))
+            continue
+        pending.append((name, at, call))
+
+    if not pending:
+        if done == len(PATCH_SITES):
+            print('  DLL 已是补丁状态，跳过')
+        else:
+            print('  DLL 未能打补丁：没有任何补丁点被识别。')
+            print('  如果是新版本游戏，可以到仓库提 issue；')
+            print('  或者直接把仓库 dll/Assembly-CSharp.dll 复制过去覆盖（需版本一致）。')
+        return
+
+    # 备份原版（只备份一次）
+    bak = dll + '.orig_backup'
+    if not os.path.exists(bak):
+        shutil.copy2(dll, bak)
+        print('  已备份原版 -> %s' % os.path.basename(bak))
+
+    for name, at, call in pending:
+        data[at:at + 5] = PATCH_NEW
+        print('  [补丁] %s: 0x%06X  %s -> %s' %
+              (name, at, call.hex(' '), PATCH_NEW.hex(' ')))
+
+    assert len(data) == orig_len, '内部错误：补丁改变了文件长度'
+    open(dll, 'wb').write(bytes(data))
+    print('  DLL 补丁完成（共 %d 处，文件长度未变）' % len(pending))
+    print('  提示：如果 hosts 里还有 rz.protect-file.com 那条，现在可以删掉了。')
 
 
-def ensure_hosts():
-    """游戏启动时会去连 rz.protect-file.com 做授权校验，连不上才会走离线分支。
-    这里把它指到 127.0.0.1，省得每台机器手动改。"""
-    if not os.path.exists(HOSTS_PATH):
-        print('  找不到 hosts 文件，跳过')
-        return True
-    try:
-        with open(HOSTS_PATH, 'r', encoding='utf-8', errors='ignore') as f:
-            content = f.read()
-    except PermissionError:
-        print('  读取 hosts 被拒绝，跳过')
-        return True
-
-    if HOSTS_DOMAIN in content:
-        print('  hosts 已配置 %s，跳过' % HOSTS_DOMAIN)
-        return True
-
-    try:
-        bak = HOSTS_PATH + '.kjhaz_bak'
-        if not os.path.exists(bak):
-            shutil.copy2(HOSTS_PATH, bak)
-        with open(HOSTS_PATH, 'a', encoding='utf-8', newline='\n') as f:
-            f.write('\n%s %s\n' % (HOSTS_IP, HOSTS_DOMAIN))
-        print('  已写入 hosts: %s %s' % (HOSTS_IP, HOSTS_DOMAIN))
-    except PermissionError:
-        print('  写入 hosts 被拒绝（需要管理员权限），可手动添加: %s %s' % (HOSTS_IP, HOSTS_DOMAIN))
-    except Exception as e:
-        print('  写入 hosts 失败: %s' % e)
-    return True
+def restore_dll(game_root):
+    dll = find_dll(game_root)
+    bak = dll + '.orig_backup'
+    if not os.path.exists(bak):
+        sys.exit('没有找到备份 %s，无法还原' % bak)
+    shutil.copy2(bak, dll)
+    print('已还原官方原版 DLL: %s' % dll)
 
 
 def find_mod_dir(game_root):
@@ -158,6 +204,11 @@ def looks_like_game_root(path):
 
 
 def main():
+    if len(sys.argv) >= 2 and sys.argv[1] in ('--restore', '-r'):
+        root = sys.argv[2] if len(sys.argv) >= 3 else os.getcwd()
+        restore_dll(root)
+        return
+
     if len(sys.argv) >= 2:
         game_root = sys.argv[1]
     else:
@@ -172,14 +223,10 @@ def main():
             print('      或者运行  python install.py "游戏根目录"')
             sys.exit(1)
 
-    # 改 hosts 需要管理员权限，不够就提权重启自己（会弹一次 UAC）
-    if not is_admin():
-        print('需要管理员权限来配置 hosts（游戏必须屏蔽授权校验域名才能进 MOD）。')
-        if relaunch_as_admin():
-            print('已请求提权，请在弹出的窗口里确认…')
-            sys.exit(0)
-        print('提权被取消，继续安装（hosts 那步可能需要你手动处理）。')
+    print('\n[1/2] 给游戏主程序打补丁（去掉授权校验）')
+    patch_dll(game_root)
 
+    print('\n[2/2] 安装剧情回放 MOD')
     mod_dir = find_mod_dir(game_root)
     lua_dir = os.path.join(mod_dir, 'lua')
     print('MOD 目录: %s' % mod_dir)
@@ -191,10 +238,8 @@ def main():
     patch_main_lua(os.path.join(lua_dir, 'main.lua'))
     patch_gameengine(os.path.join(lua_dir, 'GameEngine.lua'))
 
-    print('\n[hosts] 屏蔽授权校验域名')
-    ensure_hosts()
-
-    print('\n安装完成。进游戏后点左上角主角头像（打开「江湖」面板）即可呼出剧情回放。')
+    print('\n安装完成。不需要改 hosts 了。')
+    print('进游戏后点左上角主角头像（打开「江湖」面板），再点「江湖历练」标签即可呼出剧情回放。')
 
 
 if __name__ == '__main__':

@@ -2,6 +2,8 @@
 
 给《金庸群侠传X》加一个**剧情回放**界面：像 galgame 的「场景回放」一样，把游戏里**全部剧情**列出来，搜索、翻页、点一下就跳过去看。
 
+顺带解决另一个问题：**去掉游戏启动时的域名授权校验，不再需要改 hosts**。
+
 ## 为什么需要它
 
 游戏自带的控制台只能敲 `story 剧情key` 跳转，但：
@@ -63,24 +65,64 @@ python install.py "你的游戏根目录"
 > 路径里有括号或空格时，要用英文双引号包起来。
 
 脚本会自动：
-1. 复制 `lua/replay.lua`、`lua/replay_main.lua` 到 MOD 的 lua 目录
-2. 在 `main.lua` 的 `ROOT_getLuaFiles` 里注册
-3. 在 `GameEngine.lua` 的 `GameEngine_jianghuContent` 里插入呼出入口
-4. **自动配置 hosts**（见下）
 
-可重复运行，不会重复插入。**换 MOD / MOD 更新后重跑一次即可。**
+1. 给 `金庸群侠传X_Data/Managed/Assembly-CSharp.dll` 打补丁（去掉域名授权校验，见下）
+2. 复制 `lua/replay.lua`、`lua/replay_main.lua` 到 MOD 的 lua 目录
+3. 在 `main.lua` 的 `ROOT_getLuaFiles` 里注册
+4. 在 `GameEngine.lua` 的 `GameEngine_jianghuContent` 里插入呼出入口
 
-### 关于 hosts
+可重复运行，不会重复插入，也不会重复打补丁。**换 MOD / MOD 更新后重跑一次即可。**
 
-这个 MOD 版游戏启动时会去连 `rz.protect-file.com` 做授权校验，连不上才会走离线分支——所以原版整合包要求你手动改 hosts。脚本会替你处理这条规则：
+> `install.py` 和 `lua/` 目录要放在一起（脚本按相对路径找 `lua/replay.lua`）。
+
+### 关于授权校验（不再需要改 hosts）
+
+游戏启动时会执行这么一句判断：
+
+```csharp
+NetworkClass.GetHostAddress("rz.protect-file.com") != "127.0.0.1"
+```
+
+- **相等** → 走本地模式 → 正常加载资源
+- **不相等** → 走在线模式 → 去连 `www.jy-x.com` 拉 AssetBundle，连不上就放弃加载 → 卡在进度 100%
+
+所以老的教程都是让你改 hosts，把这个域名指到 `127.0.0.1`，人为制造「相等」。
+
+**现在改成直接改程序本身**，效果和改 hosts 完全等价：
+
+| | 位置 | 原始字节 | 补丁后 |
+| --- | --- | --- | --- |
+| 1 | `ResourceManager.LoadResource` | `28 09 04 00 06` | `26 26 16 00 00` |
+| 2 | `RuntimeData.Load` | `28 5B 05 00 06` | `26 26 16 00 00` |
+
+原始指令是 `call <string::op_Inequality 包装>`，补丁后是 `pop; pop; ldc.i4.0; nop; nop`。
+
+两者**栈效果完全相同**（吃掉 2 个 string、压入 1 个 bool），唯一区别是结果恒为 `false`，也就是「域名 == 127.0.0.1」永远成立。
+
+> **为什么能这么做**：这两处判断藏在混淆器的「控制流平坦化」里（`switch` + 状态变量反复跳），但判断本身还是老老实实的一条 `call`。方法体总长不变、不碰元数据表、不碰异常处理表，属于最安全的原地字节补丁。
+>
+> **为什么不是改字符串**：`rz.protect-file.com` 在 DLL 里没有明文（`#US` 流只有 4 字节），字符串是加密的、运行时才解出来拼接。所以改字符串目录这条路走不通——但改**判断点**只要 5 个字节。
+>
+> 补丁按**代码签名定位**（每处前面有 21 字节唯一上下文），不依赖文件 MD5，也不改文件长度。脚本会先备份原版为 `Assembly-CSharp.dll.orig_backup`。
+
+**如果你之前配过 hosts**：现在可以把 `127.0.0.1 rz.protect-file.com` 那行删掉了，删不删都不影响游戏。
+
+想还原官方原版 DLL：
 
 ```
-127.0.0.1 rz.protect-file.com
+python install.py --restore "你的游戏根目录"
 ```
 
-因为改 hosts 需要管理员权限，**脚本会弹一次 UAC 提权**（点「是」即可）。已经配置过的话会自动跳过，不会重复写入。原 hosts 会备份成 `hosts.kjhaz_bak`。
+### 手动替换（万一脚本打不上补丁）
 
-不想让脚本动 hosts 的话，在 UAC 弹窗点「否」，安装照常完成，但你需要自己加这条规则，否则进不了 MOD。
+`dll/` 目录里放了两个文件：
+
+| 文件 | 说明 |
+| --- | --- |
+| `dll/Assembly-CSharp.dll` | 已打补丁的版本（MD5 `daa937e6…`） |
+| `dll/Assembly-CSharp.orig.dll` | 官方原版备份（MD5 `11ff4290…`） |
+
+把它们复制到 `金庸群侠传X_Data/Managed/` 覆盖同名文件即可——**仅适用于客户端 V1.1.0.6 / 绅士无双后宫版 V119.5 这一版**，其它版本请优先用脚本打补丁。
 
 ## 使用
 
@@ -101,10 +143,12 @@ python install.py "你的游戏根目录"
 | --- | --- |
 | `lua/replay.lua` | 入口层：算 MOD 路径、热重载业务模块 |
 | `lua/replay_main.lua` | 业务层：读剧情库、建 UI、搜索、跳转 |
+| `dll/Assembly-CSharp.dll` | 已打补丁的游戏主程序（去授权校验），手动替换用 |
+| `dll/Assembly-CSharp.orig.dll` | 官方原版备份，用于还原 |
 | `replay_catalog.txt` | 剧情缓存（5950 条剧情名），首次运行生成在**游戏根目录** |
 | `replay_cg_index.txt` | CG 事件索引，每行「剧情名<TAB>CGs/xxx,CGs/yyy」，首次点「只看CG」时生成在**游戏根目录** |
 | `replay_movie_index.txt` | 影片事件索引（哪些剧情播过 Movies 里的影片） |
-| `install.py` | 安装脚本 |
+| `install.py` | 安装脚本（含 DLL 补丁） |
 
 运行时会在**游戏根目录**（有 `金庸群侠传X.exe` 的那层）生成三个缓存文件：
 
@@ -127,6 +171,7 @@ UI 尺寸按 2452×1321 的渲染分辨率标定。换分辨率后如果界面�
 
 ## 已知限制
 
-- **hosts 那条规则没法写进游戏文件里**：域名 `rz.protect-file.com` 在游戏目录的任何文件里都搜不到明文（`Assembly-CSharp.dll`、lua 脚本、资源全查过了），说明是 native 层动态拼接或加密的，没有可替换的字符串。所以只能走系统级 DNS 重定向，做成安装时自动配置。
+- **DLL 补丁按代码签名匹配**，不是按版本号。如果哪天游戏大更新、这两处判断的上下文变了，脚本会拒绝打补丁并提示，不会把文件改坏。这时可以提 issue，或者用 `dll/` 里的文件手动替换（需版本一致）。
+- 补丁只改「判断点」，游戏本身的授权逻辑（连接、校验、加密）都还在，只是永远走本地分支。
 - 跳转时会强制关闭地图上的若干面板（人物 / 队伍 / 背包等），这是为了让剧情不被遮挡。跳完剧情会正常回到地图。
 - 剧情是从「当前存档」的状态开始播的，所以有些剧情会因为缺少前置条件而表现异常（比如直接跳过、或对话内容不全）。这是剧情本身的依赖，不是 MOD 的问题。
