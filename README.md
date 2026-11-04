@@ -101,10 +101,18 @@ python install.py "你的游戏根目录"
 | --- | --- |
 | `lua/replay.lua` | 入口层：算 MOD 路径、热重载业务模块 |
 | `lua/replay_main.lua` | 业务层：读剧情库、建 UI、搜索、跳转 |
-| `replay_catalog.txt` | 从游戏里导出的完整剧情清单（5950 条），备份用 |
+| `replay_catalog.txt` | 剧情缓存（5950 条剧情名），首次运行生成在**游戏根目录** |
+| `replay_cg_index.txt` | CG 事件索引，每行「剧情名<TAB>CGs/xxx,CGs/yyy」，首次点「只看CG」时生成在**游戏根目录** |
+| `replay_movie_index.txt` | 影片事件索引（哪些剧情播过 Movies 里的影片） |
 | `install.py` | 安装脚本 |
 
-运行时会在 MOD 目录生成 `replay_catalog.txt`（剧情缓存，删掉会自动重建）。
+运行时会在**游戏根目录**（有 `金庸群侠传X.exe` 的那层）生成三个缓存文件：
+
+- `replay_catalog.txt` —— 剧情名缓存
+- `replay_cg_index.txt` —— CG 事件 + 引用的具体文件名
+- `replay_movie_index.txt` —— 影片事件
+
+删掉任何一个都会自动重建（CG/影片索引重建约 0.4 秒）。
 
 ## 调参
 

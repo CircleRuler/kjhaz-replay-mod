@@ -14,6 +14,7 @@ local Vector2 = luanet.import_type('UnityEngine.Vector2')
 local Color = luanet.import_type('UnityEngine.Color')
 local Font = luanet.import_type('UnityEngine.Font')
 local RuntimeData = luanet.import_type('JyGame.RuntimeData')
+local Application = luanet.import_type('UnityEngine.Application')
 
 local function L(s)
     Debug.LogError('[RP] ' .. tostring(s))
@@ -21,6 +22,16 @@ end
 
 local function moddir()
     return _G.REPLAY_MODDIR or 'gamedata/modcache/SSWS_HG'
+end
+
+-- 游戏根目录（有 金庸群侠传X.exe 的那层）。Application.dataPath 指向 xxx_Data，取其父目录
+local function gameroot()
+    local ok, dp = pcall(function() return Application.dataPath end)
+    if ok and dp ~= nil then
+        local root = string.match(dp, '^(.*)[/\\][^/\\]+$')
+        if root ~= nil and #root > 0 then return root end
+    end
+    return moddir() .. '/../../..'
 end
 
 -- 调试开关：改成 true 会把过程写入 replay_trace.log
@@ -83,7 +94,7 @@ local function toUnityAction(fn)
 end
 
 local function writeOut(name, text)
-    local p = moddir() .. '/' .. name
+    local p = gameroot() .. '/' .. name
     local ok, e = pcall(function() File.WriteAllText(p, text) end)
     if not ok then L('write fail ' .. p .. ' :: ' .. tostring(e)) end
 end
@@ -135,7 +146,7 @@ end
 
 local function getCatalog()
     if _G.REPLAY_CATALOG then return _G.REPLAY_CATALOG end
-    local p = moddir() .. '/' .. CATALOG_FILE
+    local p = gameroot() .. '/' .. CATALOG_FILE
     local ok, txt = pcall(function() return File.ReadAllText(p) end)
     local names = {}
     if ok and txt and #txt > 0 then
@@ -400,6 +411,7 @@ local function buildCGIndex()
 
     local out, movieOut = {}, {}
     local seen, seenMovie = {}, {}
+    local detail = {}   -- 剧情名 -> { 引用的文件名... }
     local scanned = 0
     local sampleLogged = false
     local typeCount = {}
@@ -427,18 +439,39 @@ local function buildCGIndex()
                             or (cgKeys['场景.' .. tostring(vl)] ~= nil)
                         local isMovie = (movieKeys[vl] ~= nil)
                             or (string.sub(vl, 1, 7) == 'Movies/')
-                        -- 影片如果单独有类型，也认
-                        if tp ~= nil and string.find(tp, 'MOVIE') ~= nil then
+                        -- 影片有专门类型：VIDEO / MOVIE（实测类型池里两个都有）
+                        if tp == 'VIDEO' or tp == 'MOVIE'
+                            or (tp ~= nil and string.find(tp, 'MOVIE') ~= nil) then
                             isMovie = true
                             movieTypeCount[tp] = (movieTypeCount[tp] or 0) + 1
                         end
-                        if isCG and not seen[nm] then
-                            out[#out + 1] = nm
-                            seen[nm] = true
+                        if isCG then
+                            if not seen[nm] then
+                                out[#out + 1] = nm
+                                seen[nm] = true
+                            end
+                            detail[nm] = detail[nm] or {}
+                            -- vl 可能只是简写（如「郭襄」），实际资源 key 是「场景.郭襄」
+                            local f = cgKeys[vl]
+                            if f == nil then f = cgKeys['场景.' .. tostring(vl)] end
+                            if f == nil then f = vl end
+                            if not detail[nm][f] then
+                                detail[nm][f] = true
+                                detail[nm][#detail[nm] + 1] = f
+                            end
                         end
-                        if isMovie and not seenMovie[nm] then
-                            movieOut[#movieOut + 1] = nm
-                            seenMovie[nm] = true
+                        if isMovie then
+                            if not seenMovie[nm] then
+                                movieOut[#movieOut + 1] = nm
+                                seenMovie[nm] = true
+                            end
+                            detail[nm] = detail[nm] or {}
+                            -- 影片 value 形如 doa-1-01#0#1，去掉片段参数
+                            local f = 'Movies/' .. tostring(vl):gsub('#.*$', '')
+                            if not detail[nm][f] then
+                                detail[nm][f] = true
+                                detail[nm][#detail[nm] + 1] = f
+                            end
                         end
                     end
                 end
@@ -470,6 +503,7 @@ local function buildCGIndex()
         scanned, keyCount, movieKeyCount, #out, #movieOut, dt,
         (#mt > 0 and ('，影片类型 ' .. table.concat(mt, ' ')) or '')))
     _G.REPLAY_MOVIELIST = movieOut
+    _G.REPLAY_DETAIL = detail
     return out, nil, keyCount, scanned
 end
 
@@ -477,12 +511,14 @@ end
 local MOVIE_INDEX_FILE = 'replay_movie_index.txt'
 
 local function readIndexFile(name)
-    local p = moddir() .. '/' .. name
+    local p = gameroot() .. '/' .. name
     local ok, txt = pcall(function() return File.ReadAllText(p) end)
     if not ok or not txt or #txt == 0 then return nil end
     local list = {}
     for line in txt:gmatch('[^\r\n]+') do
-        if #line > 0 then list[#list + 1] = line end
+        -- 新格式是「剧情名<TAB>文件1,文件2」，只取剧情名
+        local nm = line:match('^([^\t]+)')
+        if nm ~= nil and #nm > 0 then list[#list + 1] = nm end
     end
     if #list == 0 then return nil end
     return list
@@ -511,13 +547,25 @@ function getCGList(forceRebuild)
         return nil
     end
     _G.REPLAY_CGLIST = list
-    writeIndexFile(CG_INDEX_FILE, list)
+    -- 写入时把每个剧情引用的文件名一起写进去（TAB 分隔，文件名逗号分隔）
+    local detail = _G.REPLAY_DETAIL or {}
+    local lines = {}
+    for _, nm in ipairs(list) do
+        local files = detail[nm]
+        if files ~= nil and #files > 0 then
+            lines[#lines + 1] = nm .. '\t' .. table.concat(files, ',')
+        else
+            lines[#lines + 1] = nm
+        end
+    end
+    writeIndexFile(CG_INDEX_FILE, lines)
     writeIndexFile(MOVIE_INDEX_FILE, _G.REPLAY_MOVIELIST or {})
     return list
 end
 
 -- 影片列表（由 buildCGIndex 填充；缓存路径下也从文件读）
-local function getMovieList()
+-- 注意：必须用 function 赋值给前面声明的 local，不能写 local function（会新建一个遮蔽它）
+function getMovieList()
     if _G.REPLAY_MOVIELIST then return _G.REPLAY_MOVIELIST end
     getCGList()
     return _G.REPLAY_MOVIELIST or {}
@@ -583,7 +631,7 @@ local function buildUI()
     place(closeGo, hw - 36, hh - 42, 44, 44)
 
     -- ===== 搜索栏（用游戏原生输入框，Unity 运行时 InputField 的 IME 不可用）=====
-    local searchW = PW - 500
+    local searchW = PW - 640
     local searchBg, searchImg = makePanel(root, 'SearchBg', Color(0.16, 0.18, 0.24, 1))
     searchImg.raycastTarget = true
     place(searchBg, -hw + 30 + searchW / 2, hh - 94, searchW, 52)
@@ -658,10 +706,26 @@ local function buildUI()
         applyFilter(st2)
         buildUI()
     end)
-    place(cgBtn, hw - 345, hh - 94, 130, 52)
+    place(cgBtn, hw - 335, hh - 94, 110, 52)
     if st.onlyCG then
         local cimg = cgBtn:GetComponent(typeOf('UnityEngine.UI.Image'))
         if cimg then cimg.color = Color(0.62, 0.46, 0.10, 0.98) end
+    end
+
+    -- 只看影片：过滤出所有播放过 Movies 影片的事件
+    local mvLabel = st.onlyMovie and '影片 ✓' or '只看影片'
+    local mvBtn = makeButton(root, 'MovieBtn', mvLabel, function()
+        local st2 = getState()
+        st2.onlyMovie = not st2.onlyMovie
+        if st2.onlyMovie then st2.onlyCG = false end
+        st2.keyword = ''
+        applyFilter(st2)
+        buildUI()
+    end)
+    place(mvBtn, hw - 460, hh - 94, 120, 52)
+    if st.onlyMovie then
+        local mimg = mvBtn:GetComponent(typeOf('UnityEngine.UI.Image'))
+        if mimg then mimg.color = Color(0.62, 0.46, 0.10, 0.98) end
     end
 
 
