@@ -526,7 +526,7 @@ end
 
 local function writeIndexFile(name, list)
     pcall(function()
-        File.WriteAllText(moddir() .. '/' .. name, table.concat(list, '\n'))
+        File.WriteAllText(gameroot() .. '/' .. name, table.concat(list, '\n'))
     end)
 end
 
